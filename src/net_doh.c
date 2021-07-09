@@ -395,7 +395,7 @@ static int _submit_dns_query_get(struct perf_net_socket* sock, const void* buf, 
 
     self->http2->stream->stream_id = stream_id;
 
-    // debugx("qid: %d, stream_id: %d", self->qid, stream_id);
+    debugx("qid: %d, stream_id: %d", self->qid, stream_id);
 
     ret = nghttp2_session_send(self->http2->session);
     if (ret < 0) {
@@ -751,7 +751,7 @@ static int _http2_init(struct perf__doh_socket* sock)
         perf_log_fatal("Failed to initialize http2 session: %s", nghttp2_strerror(ret));
     }
 
-    memset(self->http2->dnsmsg, 0, DNS_MSG_MAX_SIZE);
+    // memset(self->http2->dnsmsg, 0, DNS_MSG_MAX_SIZE);
     self->http2->dnsmsg_at = 0;
     self->http2->settings_sent = 0;
     self->http2->dnsmsg_completed = false;
@@ -842,7 +842,8 @@ static ssize_t perf__doh_recv(struct perf_net_socket* sock, void* buf, size_t le
                                        (uint8_t*) self->recvbuf + (self->at - n), 
                                        n);
  
-        memset(self->recvbuf, 0, len);
+        // memset(self->recvbuf, 0, len);
+        self->at = 0;
     
         if (ret < 0) {
             // 
@@ -876,7 +877,7 @@ static ssize_t perf__doh_recv(struct perf_net_socket* sock, void* buf, size_t le
         }
 
         memcpy(buf, self->http2->dnsmsg, self->http2->dnsmsg_at);
-        memset(self->http2->dnsmsg, 0, DNS_MSG_MAX_SIZE);
+        // memset(self->http2->dnsmsg, 0, DNS_MSG_MAX_SIZE);
 
         self->http2->dnsmsg_completed = false;
         int response_len = self->http2->dnsmsg_at;
@@ -897,10 +898,12 @@ static ssize_t perf__doh_sendto(struct perf_net_socket* sock, uint16_t qid, cons
 
     PERF_LOCK(&self->lock);
 
+    /*
     if (self->request_sent) {
         PERF_UNLOCK(&self->lock);
         return 0;
     }
+    */
 
     self->qid = qid;
  
@@ -968,25 +971,21 @@ static int perf__doh_sockready(struct perf_net_socket* sock, int pipe_fd, int64_
         }
     }
 
-    // socket is ready and we sent the response
-    // we need to reconnect
     if (self->is_ready &&
-        self->response_sent) {
-        self->response_sent = false;
-        self->request_sent = false;
-        self->http2->settings_sent = false;
-        self->do_reconnect = true;
+        self->is_sending) {
         PERF_UNLOCK(&self->lock);
         return 0;
     }
 
     // socket is ready and we received request already
     // pretend that the socket is not available
+    /*
     if (self->is_ready &&
         self->request_sent) {
         PERF_UNLOCK(&self->lock);
         return 0;
     }
+    */
 
     if (!self->is_conn_ready) {
         switch (perf_os_waituntilanywritable(&sock, 1, pipe_fd, timeout)) {
