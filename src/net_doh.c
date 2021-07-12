@@ -231,6 +231,23 @@ int base64_decode(const uint8_t *in,
     return ret;
 }
 
+#ifndef OPENSSL_NO_NEXTPROTONEG
+/* NPN TLS extension check */
+static int select_next_proto_cb(SSL *ssl, unsigned char **out,
+                                unsigned char *outlen, const unsigned char *in,
+                                unsigned int inlen, void *arg) {
+    (void)ssl;
+    (void)arg;
+
+    if (nghttp2_select_next_protocol(out, outlen, in, inlen) <= 0) {
+        perf_log_warning("Server did not advertise %u", NGHTTP2_PROTO_VERSION_ID);
+        return SSL_TLSEXT_ERR_ALERT_WARNING;
+    }
+
+  return SSL_TLSEXT_ERR_OK;
+}
+#endif /* !OPENSSL_NO_NEXTPROTONEG */
+
 // TODO: move
 static void perf__doh_connect(struct perf_net_socket* sock)
 {
@@ -317,6 +334,16 @@ static void perf__doh_reconnect(struct perf_net_socket* sock)
     }
     
     perf__doh_connect(sock);
+
+    // SSL context has changed
+ 
+    #ifndef OPENSSL_NO_NEXTPROTONEG
+        SSL_CTX_set_next_proto_select_cb(ssl_ctx, select_next_proto_cb, NULL);
+    #endif /* !OPENSSL_NO_NEXTPROTONEG */
+
+    #if OPENSSL_VERSION_NUMBER >= 0x10002000L
+        SSL_CTX_set_alpn_protos(ssl_ctx, (const unsigned char *)"\x02h2", 3);
+    #endif // OPENSSL_VERSION_NUMBER >= 0x10002000L
 }
 
 static int _submit_dns_query_get(struct perf_net_socket* sock, const void* buf, size_t len)
@@ -621,16 +648,6 @@ static int _http2_header_cb(nghttp2_session* session, const nghttp2_frame* frame
 static int _http2_stream_close_cb(nghttp2_session* session, int32_t stream_id, uint32_t error_code, void* user_data)
 {
     (void)user_data;
-
-    if (nghttp2_session_get_stream_user_data(session, stream_id)) {
-        int ret;
-        ret = nghttp2_session_terminate_session(session, NGHTTP2_NO_ERROR);
-
-        if (ret != 0) {
-            return NGHTTP2_ERR_CALLBACK_FAILURE;
-        }
-    }
-
     return 0;
 }
 
@@ -841,6 +858,7 @@ static ssize_t perf__doh_recv(struct perf_net_socket* sock, void* buf, size_t le
     }
 
     debugx("SSL_read completed - n: %ld, at: %ld", n, self->at);
+    // fwrite(self->recvbuf + self->at, 1, self->at, stderr);
 
     PERF_UNLOCK(&self->lock);
 
@@ -1020,9 +1038,11 @@ static int perf__doh_sockready(struct perf_net_socket* sock, int pipe_fd, int64_
     if (!self->is_conn_ready) {
         switch (perf_os_waituntilanywritable(&sock, 1, pipe_fd, timeout)) {
         case PERF_R_TIMEDOUT:
+            debugx("os timeout");
             PERF_UNLOCK(&self->lock);
             return -1;
         case PERF_R_SUCCESS: {
+            debugx("os success");
             int       error = 0;
             socklen_t len   = (socklen_t)sizeof(error);
 
@@ -1044,6 +1064,7 @@ static int perf__doh_sockready(struct perf_net_socket* sock, int pipe_fd, int64_
             break;
         }
         default:
+            debugx("os - default: -1");
             PERF_UNLOCK(&self->lock);
             return -1;
         }
@@ -1051,6 +1072,7 @@ static int perf__doh_sockready(struct perf_net_socket* sock, int pipe_fd, int64_
     }
 
     int ret = SSL_connect(self->ssl);
+    debugx("SSL connect - ret: %d", ret);
     if (!ret) {
         // unrecoverable error, reconnect
         self->do_reconnect = true;
@@ -1097,6 +1119,7 @@ static int perf__doh_sockready(struct perf_net_socket* sock, int pipe_fd, int64_
         return 0;
     }
 
+    debugx("settings_sent: %d", self->http2->settings_sent);
     // guard against re-entrant http2_init
     if (!self->http2->settings_sent) {
         // send settings
@@ -1127,24 +1150,6 @@ static bool perf__doh_have_more(struct perf_net_socket* sock)
 {
     return self->have_more;
 }
-
-#ifndef OPENSSL_NO_NEXTPROTONEG
-/* NPN TLS extension check */
-static int select_next_proto_cb(SSL *ssl, unsigned char **out,
-                                unsigned char *outlen, const unsigned char *in,
-                                unsigned int inlen, void *arg) {
-    (void)ssl;
-    (void)arg;
-
-    if (nghttp2_select_next_protocol(out, outlen, in, inlen) <= 0) {
-        perf_log_warning("Server did not advertise %u", NGHTTP2_PROTO_VERSION_ID);
-        return SSL_TLSEXT_ERR_ALERT_WARNING;
-    }
-
-  return SSL_TLSEXT_ERR_OK;
-}
-#endif /* !OPENSSL_NO_NEXTPROTONEG */
-
 struct perf_net_socket* perf_net_doh_opensocket(const perf_sockaddr_t* server, const perf_sockaddr_t* local, size_t bufsize)
 {
     struct perf__doh_socket* tmp  = calloc(1, sizeof(struct perf__doh_socket)); // clang scan-build
