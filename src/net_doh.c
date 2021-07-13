@@ -45,7 +45,7 @@ const char* net_doh_uri = DEFAULT_DOH_URI;
 const char* net_doh_method = DEFAULT_DOH_METHOD;
 
 #define self ((struct perf__doh_socket*)sock)
-#define DEFAULT_MAX_CONCURRENT_STREAMS 100
+#define DEFAULT_MAX_CONCURRENT_STREAMS 1
 
 #define MAKE_NV(NAME, VALUE)                                                   \
   {                                                                            \
@@ -98,9 +98,12 @@ struct perf__doh_socket {
     pthread_mutex_t lock;
     SSL*            ssl;
 
-    char   recvbuf[TCP_RECV_BUF_SIZE], sendbuf[TCP_SEND_BUF_SIZE];
-    size_t sending;
-    bool   is_ready, is_conn_ready, have_more, is_sending, do_reconnect;
+    char   recvbuf[TCP_RECV_BUF_SIZE];
+    char   sendbuf[TCP_SEND_BUF_SIZE];
+    bool   is_ready;
+    bool   is_conn_ready; 
+    bool   have_more;
+    bool   do_reconnect;
 
     perf_sockaddr_t server, local;
     size_t          bufsize;
@@ -322,18 +325,12 @@ static void perf__doh_reconnect(struct perf_net_socket* sock)
     close(sock->fd);
     self->have_more = false;
 
-    if (self->sending) {
-        self->sending    = 0;
-        self->is_sending = false;
-    }
     self->is_conn_ready = false;
     if (self->http2) {
         self->http2->settings_sent = false;
     }
     
     perf__doh_connect(sock);
-
-    // SSL context has changed
  
     #ifndef OPENSSL_NO_NEXTPROTONEG
         SSL_CTX_set_next_proto_select_cb(ssl_ctx, select_next_proto_cb, NULL);
@@ -349,13 +346,7 @@ static int _submit_dns_query_get(struct perf_net_socket* sock, const void* buf, 
     int32_t stream_id;
     uint8_t *cp;
     int ret = -1;
-   
-    // GET -> convert to base64
     uint8_t* base64_dns_msg = self->base64_dns_msg;
-
-    if (!base64_dns_msg) {
-        perf_log_fatal("failed to allocate memory");
-    }
 
     ret = base64_encode(buf, len, base64_dns_msg);
     if (ret < 0) {
@@ -596,8 +587,6 @@ static ssize_t _http2_send_cb(nghttp2_session* session,
             case ENOTCONN:
             case EPIPE:
                 perf__doh_reconnect(sock);
-                self->is_sending = true;
-                self->sending    = 0;
                 errno = EINPROGRESS;
                 return NGHTTP2_ERR_CALLBACK_FAILURE;
             default:
@@ -607,8 +596,6 @@ static ssize_t _http2_send_cb(nghttp2_session* session,
             return -1;
         case SSL_ERROR_WANT_READ:
         case SSL_ERROR_WANT_WRITE:
-            self->is_sending = true;
-            self->sending    = 0;
             errno = EINPROGRESS;
             return NGHTTP2_ERR_WOULDBLOCK;
         default:
@@ -619,29 +606,7 @@ static ssize_t _http2_send_cb(nghttp2_session* session,
         return NGHTTP2_ERR_CALLBACK_FAILURE;
     }
 
-    self->is_sending = false;
-    self->sending = 0;
-
     return n;
-}
-
-static int _http2_header_cb(nghttp2_session* session, const nghttp2_frame* frame, const uint8_t* name, size_t namelen, const uint8_t* value, size_t valuelen, uint8_t flags, void* user_data)
-{
-    (void)user_data;
-    (void)flags;
-
-    // // debugx("header_cb - type: %d, session_id: %d", frame->hd.type, frame->hd.stream_i
-    switch (frame->hd.type) {
-    case NGHTTP2_HEADERS:
-       break;
-    }
-    return 0;
-}
-
-static int _http2_stream_close_cb(nghttp2_session* session, int32_t stream_id, uint32_t error_code, void* user_data)
-{
-    (void)user_data;
-    return 0;
 }
 
 static int _http2_frame_recv_cb(nghttp2_session* session, const nghttp2_frame* frame, void* user_data)
@@ -665,34 +630,7 @@ static int _http2_frame_recv_cb(nghttp2_session* session, const nghttp2_frame* f
         }
         break;
     case NGHTTP2_SETTINGS:
-        if (frame->hd.flags & NGHTTP2_FLAG_ACK) {
-            // debugx("Settings ACK received\n");
-        } else {
-            // debugx("Settings FRAME received\n");
-        }
         break;
-    case NGHTTP2_RST_STREAM:
-        break;
-    case NGHTTP2_GOAWAY:
-        // debugx("GOAWAY <-");
-        break;
-    }
-    
-    return 0;
-}
-
-static int _http2_frame_send_cb(nghttp2_session* session, const nghttp2_frame* frame, void* user_data)
-{
-    (void)user_data;
-    
-    switch (frame->hd.type) {
-    case NGHTTP2_HEADERS:
-        // debugx("HEADERS ->");
-        break;
-    case NGHTTP2_SETTINGS:
-        // debugx("SETTINGS ->");
-        break;
-
     case NGHTTP2_RST_STREAM:
         break;
     case NGHTTP2_GOAWAY:
@@ -710,8 +648,6 @@ static int _http2_data_chunk_recv_cb(nghttp2_session* session,
 {
     perf__doh_socket_t *sock = (perf__doh_socket_t *)user_data;
     (void)flags;
-
-    // debugx("chunk_recv_cb - stream_id: %d", stream_id);
 
     if (nghttp2_session_get_stream_user_data(session, stream_id)) {
         if (self->http2->dnsmsg_at == 0) {
@@ -754,12 +690,9 @@ static int _http2_init(struct perf__doh_socket* sock)
     /* sets HTTP/2 callbacks */
     assert(nghttp2_session_callbacks_new(&callbacks) == 0);
     nghttp2_session_callbacks_set_send_callback(callbacks, _http2_send_cb);
-    nghttp2_session_callbacks_set_on_header_callback(callbacks, _http2_header_cb);
     nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, _http2_data_chunk_recv_cb);
     nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, _http2_frame_recv_cb);
-    nghttp2_session_callbacks_set_on_frame_send_callback(callbacks, _http2_frame_send_cb); // TODO: remove - debug
-    nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, _http2_stream_close_cb);
-
+ 
     assert(nghttp2_option_new(&option) == 0);
     nghttp2_option_set_peer_max_concurrent_streams(option, self->http2->max_concurrent_streams);
 
@@ -772,7 +705,6 @@ static int _http2_init(struct perf__doh_socket* sock)
         perf_log_fatal("Failed to initialize http2 session: %s", nghttp2_strerror(ret));
     }
 
-    // memset(self->http2->dnsmsg, 0, DNS_MSG_MAX_SIZE);
     self->http2->dnsmsg_at = 0;
     self->http2->settings_sent = false;
     self->http2->dnsmsg_completed = false;
@@ -913,8 +845,6 @@ static ssize_t perf__doh_sendto(struct perf_net_socket* sock, uint16_t qid, cons
     PERF_LOCK(&self->lock);
 
     if (!self->is_ready) {
-        self->is_sending = true;
-        self->sending    = 0;
         PERF_UNLOCK(&self->lock);
         errno = EINPROGRESS;
         return -1;
