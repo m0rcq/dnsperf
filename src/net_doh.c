@@ -99,7 +99,7 @@ struct perf__doh_socket {
     SSL*            ssl;
 
     char   recvbuf[TCP_RECV_BUF_SIZE], sendbuf[TCP_SEND_BUF_SIZE];
-    size_t at, sending;
+    size_t sending;
     bool   is_ready, is_conn_ready, have_more, is_sending, do_reconnect;
 
     perf_sockaddr_t server, local;
@@ -321,7 +321,7 @@ static void perf__doh_reconnect(struct perf_net_socket* sock)
 {
     close(sock->fd);
     self->have_more = false;
-    self->at        = 0;
+
     if (self->sending) {
         self->sending    = 0;
         self->is_sending = false;
@@ -660,7 +660,6 @@ static int _http2_frame_recv_cb(nghttp2_session* session, const nghttp2_frame* f
                 return NGHTTP2_ERR_CALLBACK_FAILURE;
             }
  
-            debugx("stream_id: %d - dnsmsg_completed", frame->hd.stream_id);
             self->http2->dnsmsg_completed = true;
             self->have_more = false;
         }
@@ -812,11 +811,7 @@ static ssize_t perf__doh_recv(struct perf_net_socket* sock, void* buf, size_t le
         return -1;
     }
 
-    if (self->at >= TCP_RECV_BUF_SIZE) {
-        self->at = 0;
-    }
-
-    n = SSL_read(self->ssl, self->recvbuf + self->at, TCP_RECV_BUF_SIZE - self->at);
+    n = SSL_read(self->ssl, self->recvbuf, TCP_RECV_BUF_SIZE);
 
     if (!n) {
         perf__doh_reconnect(sock);
@@ -852,8 +847,6 @@ static ssize_t perf__doh_recv(struct perf_net_socket* sock, void* buf, size_t le
 
     PERF_UNLOCK(&self->lock);
 
-    self->at += n;
-    
     // make sure we can process data
     if (self->is_ready &&
         self->http2 != NULL) {
@@ -862,7 +855,7 @@ static ssize_t perf__doh_recv(struct perf_net_socket* sock, void* buf, size_t le
         PERF_LOCK(&self->lock);
 
         ret = nghttp2_session_mem_recv(self->http2->session, 
-                                       (uint8_t*) self->recvbuf + (self->at - n), 
+                                       (uint8_t*) self->recvbuf, 
                                        n);
      
         if (ret < 0) {
